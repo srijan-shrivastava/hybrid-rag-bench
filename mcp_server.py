@@ -13,71 +13,86 @@ process. HTTP/SSE would be the choice for a shared remote deployment, where
 you would also need auth and per-caller rate limiting — neither is meaningful
 over stdio, where the client already owns the process.
 
-Corpus and models load lazily on first tool call, not at import. MCP clients
-start servers eagerly at boot; loading a cross-encoder and 43k embeddings on
-import would stall client startup for every session, including ones that
-never search.
+Corpus, indexes and models load lazily on first tool call, not at import. MCP
+clients start servers eagerly at boot; building a BM25 index and encoding 43k
+chunks on import would stall client startup for every session, including ones
+that never search.
+
+Env vars
+--------
+HYBRID_RAG_BENCH_DATA        WANDS directory (default: "data")
+HYBRID_RAG_BENCH_STRATEGY    chunk composition for the first stage
+                             (default: "name_desc" — see INDEX_STRATEGY below)
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from enum import Enum
-from typing import Any, Literal
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-# --------------------------------------------------------------------------
-# ADAPTER LAYER -- the only part coupled to module signatures I haven't seen.
-# Confirm these four calls against src/retrieve/bm25.py and dense.py.
-# --------------------------------------------------------------------------
-
 TOOL_VERSION = "1.0.0"
 MAX_TOP_K = 50
 RERANK_DEPTH = 100
+CHUNK_POOL = 300
 SYNTHETIC_QID = 0
+
+DATA_DIR = os.environ.get("HYBRID_RAG_BENCH_DATA", "data")
+
+# Which composition the first stage indexes. name_desc is the balanced choice:
+# it is never the worst composition for any of the four methods. If you only
+# ever call hybrid_rerank, set this to name_only — that is the best row in the
+# benchmark (nDCG@10 = 0.784), because once a cross-encoder reads the
+# candidates the first stage only has to surface them, not order them.
+INDEX_STRATEGY = os.environ.get("HYBRID_RAG_BENCH_STRATEGY", "name_desc")
+
+# The cross-encoder scores name_desc text regardless of what the first stage
+# indexed, matching the benchmark's fairness rule so rerank quality is not
+# confounded with index composition.
+RERANK_DOC_STRATEGY = "name_desc"
 
 _state: dict[str, Any] = {}
 _lock = threading.Lock()
 
 
 def _load() -> dict[str, Any]:
-    """Load corpus, retrievers and reranker once, on first use."""
-    if _state:
+    """Build corpus, indexes and reranker once, on first use."""
+    if "dataset" in _state:
         return _state
     with _lock:
-        if _state:  # another thread won the race
+        if "dataset" in _state:  # another thread won the race
             return _state
 
-        from evals.golden_set import load_products  # ADAPT: loader name
-        from src.retrieve.bm25 import BM25Retriever  # ADAPT
-        from src.retrieve.dense import DenseRetriever  # ADAPT
+        from evals.golden_set import load_wands
+        from src.ingest.chunking import STRATEGIES
+        from src.retrieve.bm25 import BM25Index
+        from src.retrieve.dense import DenseIndex, SentenceTransformerEncoder
         from src.retrieve.rerank import SentenceTransformersCrossEncoder
 
-        products = load_products()  # ADAPT -> Mapping[int, Product]
+        if INDEX_STRATEGY not in STRATEGIES:
+            raise ValueError(
+                f"Unknown strategy {INDEX_STRATEGY!r}; available: {sorted(STRATEGIES)}"
+            )
 
-        _state["products"] = products
-        _state["bm25"] = BM25Retriever(products, strategy="name_desc")  # ADAPT
-        _state["dense"] = DenseRetriever(products, strategy="name_desc")  # ADAPT
+        dataset = load_wands(DATA_DIR)
+
+        compose = STRATEGIES[INDEX_STRATEGY]
+        chunks = [c for product in dataset.products.values() for c in compose(product)]
+
+        _state["dataset"] = dataset
+        _state["bm25"] = BM25Index(chunks)
+        _state["dense"] = DenseIndex.build(
+            chunks,
+            encoder=SentenceTransformerEncoder(),
+            cache_key=INDEX_STRATEGY,  # shares the ablation's embedding cache
+        )
         _state["reranker"] = SentenceTransformersCrossEncoder()
     return _state
-
-
-def _bm25_search(query: str, depth: int) -> list[int]:
-    """ADAPT: must return a ranked list of product_ids for one query."""
-    return list(_load()["bm25"].search(query, top_k=depth))
-
-
-def _dense_search(query: str, depth: int) -> list[int]:
-    """ADAPT: must return a ranked list of product_ids for one query."""
-    return list(_load()["dense"].search(query, top_k=depth))
-
-
-# --------------------------------------------------------------------------
-# Schemas
-# --------------------------------------------------------------------------
 
 
 class RetrievalMethod(str, Enum):
@@ -108,9 +123,38 @@ def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
     return {"ok": False, "error": {"code": code, "message": message, **extra}}
 
 
-# --------------------------------------------------------------------------
-# Tools
-# --------------------------------------------------------------------------
+def _retrieve(query: str, method: RetrievalMethod, depth: int) -> list[int]:
+    """Ranked product_ids for one query under the given method."""
+    state = _load()
+
+    def bm25() -> list[int]:
+        return [pid for pid, _ in state["bm25"].search(query, top_k=depth, chunk_pool=CHUNK_POOL)]
+
+    def dense() -> list[int]:
+        return [pid for pid, _ in state["dense"].search(query, top_k=depth, chunk_pool=CHUNK_POOL)]
+
+    if method is RetrievalMethod.BM25:
+        return bm25()
+    if method is RetrievalMethod.DENSE:
+        return dense()
+
+    from src.retrieve.hybrid import rrf_fuse_rankings
+
+    fused = rrf_fuse_rankings([bm25(), dense()], top_k=depth)
+    if method is RetrievalMethod.HYBRID:
+        return fused
+
+    from src.retrieve.rerank import rerank_run
+
+    reranked = rerank_run(
+        run={SYNTHETIC_QID: fused},
+        queries={SYNTHETIC_QID: query},
+        products=state["dataset"].products,
+        model=state["reranker"],
+        rerank_depth=RERANK_DEPTH,
+        doc_strategy=RERANK_DOC_STRATEGY,
+    )
+    return reranked[SYNTHETIC_QID]
 
 
 @mcp.tool()
@@ -123,7 +167,7 @@ def search_products(
         "use 'bm25' or 'dense' when latency matters more than ranking quality.",
     ),
 ) -> dict[str, Any]:
-    """Search the product corpus and return ranked results.
+    """Search the WANDS product corpus and return a ranked list.
 
     Read-only and idempotent: the same query with the same method returns the
     same ranking, so a client may safely retry.
@@ -133,33 +177,9 @@ def search_products(
         return _error("empty_query", "Query is empty after trimming whitespace.")
 
     try:
-        state = _load()
-        products = state["products"]
-        depth = RERANK_DEPTH if method == RetrievalMethod.HYBRID_RERANK else max(top_k, 20)
-
-        if method == RetrievalMethod.BM25:
-            ranking = _bm25_search(query, depth)
-        elif method == RetrievalMethod.DENSE:
-            ranking = _dense_search(query, depth)
-        else:
-            from src.retrieve.hybrid import rrf_fuse_rankings
-
-            ranking = rrf_fuse_rankings(
-                [_bm25_search(query, depth), _dense_search(query, depth)],
-                top_k=depth,
-            )
-            if method == RetrievalMethod.HYBRID_RERANK:
-                from src.retrieve.rerank import rerank_run
-
-                reranked = rerank_run(
-                    run={SYNTHETIC_QID: ranking},
-                    queries={SYNTHETIC_QID: query},
-                    products=products,
-                    model=state["reranker"],
-                    rerank_depth=RERANK_DEPTH,
-                    doc_strategy="name_desc",
-                )
-                ranking = reranked[SYNTHETIC_QID]
+        depth = RERANK_DEPTH if method is RetrievalMethod.HYBRID_RERANK else max(top_k, 20)
+        ranking = _retrieve(query, method, depth)
+        products = _load()["dataset"].products
 
         results = []
         for rank, pid in enumerate(ranking[:top_k], start=1):
@@ -170,8 +190,9 @@ def search_products(
                 {
                     "rank": rank,
                     "product_id": pid,
-                    "name": getattr(product, "name", None),
-                    "description": (getattr(product, "description", "") or "")[:400],
+                    "name": product.name,
+                    "product_class": product.product_class,
+                    "description": product.description[:400],
                 }
             )
 
@@ -180,6 +201,7 @@ def search_products(
             "tool_version": TOOL_VERSION,
             "query": query,
             "method": method.value,
+            "index_strategy": INDEX_STRATEGY,
             "candidates_considered": len(ranking),
             "returned": len(results),
             "results": results,
@@ -192,18 +214,23 @@ def search_products(
 def get_product(
     product_id: int = Field(..., ge=0, description="Product id from a search_products result."),
 ) -> dict[str, Any]:
-    """Fetch the full record for one product id."""
+    """Fetch the full record for one product id, including parsed features."""
     try:
-        product = _load()["products"].get(product_id)
+        product = _load()["dataset"].products.get(product_id)
         if product is None:
             return _error("not_found", f"No product with id {product_id}.", product_id=product_id)
         return {
             "ok": True,
             "tool_version": TOOL_VERSION,
             "product": {
-                "product_id": product_id,
-                "name": getattr(product, "name", None),
-                "description": getattr(product, "description", None),
+                "product_id": product.product_id,
+                "name": product.name,
+                "product_class": product.product_class,
+                "category_hierarchy": product.category_hierarchy,
+                "description": product.description,
+                "features": dict(product.feature_pairs()),
+                "average_rating": product.average_rating,
+                "review_count": product.review_count,
             },
         }
     except Exception as exc:  # noqa: BLE001
@@ -215,6 +242,7 @@ def evaluate_query(
     query_id: int = Field(..., ge=0, description="WANDS query id."),
     method: RetrievalMethod = Field(RetrievalMethod.HYBRID_RERANK, description="Config to evaluate."),
     k: int = Field(10, ge=1, le=MAX_TOP_K, description="Cutoff for metrics."),
+    strict: bool = Field(True, description="Strict relevance counts Exact only; lenient adds Partial."),
 ) -> dict[str, Any]:
     """Score one WANDS query against human relevance judgments.
 
@@ -223,37 +251,37 @@ def evaluate_query(
     on labelled data, instead of taking the ranking on trust.
     """
     try:
-        from evals.golden_set import load_golden_set  # ADAPT
-        from evals.metrics import ndcg_at_k, recall_at_k  # ADAPT
+        from evals.metrics import mrr, ndcg_at_k, recall_at_k
 
-        golden = load_golden_set()
-        query_text = golden.queries.get(query_id)  # ADAPT
-        if query_text is None:
+        judgments = _load()["dataset"].judgments
+        judg = judgments.get(query_id)
+        if judg is None:
             return _error("unknown_query_id", f"No WANDS query with id {query_id}.", query_id=query_id)
 
-        search = search_products(query=query_text, top_k=k, method=method)
-        if not search.get("ok"):
-            return search
-        retrieved = [r["product_id"] for r in search["results"]]
-
-        judgments = golden.judgments.get(query_id, {})  # ADAPT: pid -> grade
-        exact = {pid for pid, grade in judgments.items() if grade == 2}
+        ranking = _retrieve(judg.query, method, max(RERANK_DEPTH, k))
 
         return {
             "ok": True,
             "tool_version": TOOL_VERSION,
             "query_id": query_id,
-            "query": query_text,
+            "query": judg.query,
+            "query_class": judg.query_class,
             "method": method.value,
             "k": k,
+            "strict": strict,
             "metrics": {
-                "recall_at_k": None if not exact else recall_at_k(retrieved, exact, k),
-                "ndcg_at_k": ndcg_at_k(retrieved, judgments, k),
-                "exact_judgments_available": len(exact),
+                "recall_at_k": recall_at_k(ranking, judg, k, strict=strict),
+                "ndcg_at_k": ndcg_at_k(ranking, judg, k),
+                "mrr_at_k": mrr(ranking, judg, k=k, strict=strict),
+            },
+            "judgments_available": {
+                "relevant_under_mode": len(judg.relevant_ids(strict=strict)),
+                "total_judged": len(judg.labels),
             },
             "note": (
-                "recall is undefined (null) when the query has no Exact judgment; "
-                "nDCG uses graded gains Exact=2, Partial=1."
+                "null means the metric is undefined for this query (no relevant "
+                "products under the chosen mode) — not zero. nDCG uses graded "
+                "gains Exact=2, Partial=1."
             ),
         }
     except Exception as exc:  # noqa: BLE001
@@ -262,5 +290,9 @@ def evaluate_query(
 
 if __name__ == "__main__":
     # stdout is the protocol channel; anything printed there corrupts it.
-    print("hybrid-rag-bench MCP server starting (stdio)", file=sys.stderr)
+    print(
+        f"hybrid-rag-bench MCP server starting (stdio) "
+        f"data={DATA_DIR} strategy={INDEX_STRATEGY}",
+        file=sys.stderr,
+    )
     mcp.run(transport="stdio")
