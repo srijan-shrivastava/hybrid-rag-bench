@@ -4,6 +4,8 @@ A reproducible ablation of hybrid retrieval on real e-commerce search: **BM25 vs
 
 Built to answer, with numbers instead of folklore: *which parts of a "modern RAG stack" actually pay for themselves?*
 
+The same retrieval stack is also exposed as an [MCP server](#mcp-server), so the measured retriever is directly callable from a model client.
+
 ## Results
 
 All configs retrieve top-100 products over the full corpus and are evaluated on all 480 queries. Recall/MRR use strict relevance (Exact only); nDCG uses graded gains (Exact=2, Partial=1). Dense model: `bge-small-en-v1.5` (local, reproducible without API keys). Reranker: `ms-marco-MiniLM-L-6-v2` over top-100 candidates.
@@ -67,9 +69,51 @@ src/retrieve/bm25.py      explicit Okapi BM25 (k1=1.5, b=0.75, stated tokenizer 
 src/retrieve/dense.py     pluggable encoders (local bge / OpenAI) x backends (numpy brute-force / Qdrant)
 src/retrieve/hybrid.py    Reciprocal Rank Fusion, ~30 explicit lines
 src/retrieve/rerank.py    cross-encoder rerank of top-N; tail preserved so recall isn't silently cut
+src/mcp_server.py         MCP server: typed tools over the retrieval stack (stdio transport)
 ```
 
 Deliberate choices: BM25 and RRF are implemented explicitly rather than through a search engine's hybrid flag, so every parameter that moves the numbers is visible in this repo. The dense backend defaults to brute-force numpy (exact, zero infra at 43k docs; ANN indexes like Qdrant/HNSW become necessary at ~1M+ vectors or when you need filtering + updates — a `QdrantBackend` is included for that shape).
+
+## MCP server
+
+The retrieval stack is also exposed as an [MCP](https://modelcontextprotocol.io) server, so a model client (Claude Desktop, or anything else speaking MCP) can query the corpus directly instead of going through a bespoke integration. The benchmark measures the retriever; the MCP server makes the same retriever *callable*.
+
+```bash
+pip install "mcp[cli]"
+python -m src.mcp_server        # stdio; normally launched by the client, not by hand
+```
+
+Register it with Claude Desktop — `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`):
+
+```json
+{
+  "mcpServers": {
+    "hybrid-rag-bench": {
+      "command": "python",
+      "args": ["-m", "src.mcp_server"],
+      "cwd": "/absolute/path/to/hybrid-rag-bench"
+    }
+  }
+}
+```
+
+### Tools
+
+| tool | purpose |
+|---|---|
+| `search_products(query, top_k, method)` | ranked retrieval; `method` ∈ `bm25` / `dense` / `hybrid` / `hybrid_rerank` |
+| `get_product(product_id)` | full record for one id |
+| `evaluate_query(query_id, method, k)` | recall@k and nDCG@k for a WANDS query against human judgments |
+
+### Design choices
+
+**Retrieval strategy is a tool parameter, not server config.** The ablation above shows the quality/latency tradeoff is real: `hybrid_rerank` gives the best nDCG@10 (0.784) but pays for a cross-encoder pass over 100 candidates, while `bm25` needs no model at all. Rather than freezing one point on that curve, the choice is exposed in the tool schema with `hybrid_rerank` as the default — the caller can drop to a cheaper config when latency matters.
+
+**`evaluate_query` exists so tool reliability is measurable.** Most retrieval tools ask the model to trust the ranking. Here the caller can check the config it just used against labelled data. Metrics follow the same conventions as the benchmark: recall returns `null` rather than `0` when a query has no Exact judgment, and nDCG uses graded gains.
+
+**Typed schemas, bounded inputs, structured errors.** `top_k` is capped server-side; queries are length-bounded; failures return an error payload with a stable `code` instead of raising across the protocol boundary, so the model can correct a call rather than seeing an opaque crash. Tool responses carry `tool_version` so a client can detect a contract change.
+
+**stdio transport.** Single-user, client-launched, local. HTTP/SSE would be the choice for a shared remote server, which is also where auth and per-caller rate limiting would start to mean something — over stdio the client already owns the process. Corpus and models load lazily on first call, since MCP clients start servers at boot and a cross-encoder load on import would stall every session, including ones that never search.
 
 ## Methodology notes
 
@@ -82,6 +126,7 @@ Deliberate choices: BM25 and RRF are implemented explicitly rather than through 
 
 - **v1.1** — LLM listwise re-ranking as a final stage (quality vs cost per 1k queries); LLM intent extraction + category pre-filtering (does predicted-category filtering help precision more than it hurts recall?)
 - **v1.2** — semantic query cache with metadata gating: hit-rate vs false-hit-rate threshold sweep on paraphrased query variants
+- **MCP** — weighted-RRF exposed as a tool parameter once finding 4 is quantified per query type; HTTP transport variant for shared/remote use
 
 ## License
 
