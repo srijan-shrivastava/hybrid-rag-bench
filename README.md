@@ -4,7 +4,7 @@ A reproducible ablation of hybrid retrieval on real e-commerce search: **BM25 vs
 
 Built to answer, with numbers instead of folklore: *which parts of a "modern RAG stack" actually pay for themselves?*
 
-The same retrieval stack is also exposed as an [MCP server](#mcp-server), so the measured retriever is directly callable from a model client.
+The benchmark measures the retriever; the MCP server makes the same retriever callable.
 
 ## Results
 
@@ -153,12 +153,6 @@ So `hybrid_rerank` is dominated almost entirely by the reranker — which is als
 - **Pooled judgments:** unjudged (query, product) pairs count as irrelevant, which slightly penalizes retrievers that surface good-but-unjudged products. Standard assumption; stated rather than hidden.
 - **Dedup:** label.csv contains 233,448 rows but 231,873 unique (query, product) pairs; 14 duplicates conflict and are resolved last-write-wins.
 - **Fairness:** every config retrieves from the identical corpus with the identical chunk text per strategy; the reranker reads `name_desc` text regardless of what the first stage indexed, so rerank quality isn't confounded with index composition.
-
-## Roadmap
-
-- **v1.1** — LLM listwise re-ranking as a final stage (quality vs cost per 1k queries); LLM intent extraction + category pre-filtering (does predicted-category filtering help precision more than it hurts recall?)
-- **v1.2** — semantic query cache with metadata gating: hit-rate vs false-hit-rate threshold sweep on paraphrased query variants
-- **MCP** — weighted-RRF exposed as a tool parameter once finding 4 is quantified per query type; HTTP transport variant for shared/remote use
 
 ## License
 
