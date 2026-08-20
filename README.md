@@ -76,14 +76,14 @@ Deliberate choices: BM25 and RRF are implemented explicitly rather than through 
 
 ## MCP server
 
-The retrieval stack is also exposed as an [MCP](https://modelcontextprotocol.io) server, so a model client (Claude Desktop, or anything else speaking MCP) can query the corpus directly instead of going through a bespoke integration. The benchmark measures the retriever; the MCP server makes the same retriever *callable*.
+The retrieval stack is also exposed as an [MCP](https://modelcontextprotocol.io) server, so a model client (Claude Desktop, Claude Code, or anything else speaking MCP) can query the corpus directly instead of going through a bespoke integration. The benchmark measures the retriever; the MCP server makes the same retriever *callable*.
 
 ```bash
 pip install "mcp[cli]"
 python -m src.mcp_server        # stdio; normally launched by the client, not by hand
 ```
 
-Register it with Claude Desktop — `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`):
+**Claude Code** — `.mcp.json` at the project root:
 
 ```json
 {
@@ -91,29 +91,61 @@ Register it with Claude Desktop — `claude_desktop_config.json` (macOS: `~/Libr
     "hybrid-rag-bench": {
       "command": "python",
       "args": ["-m", "src.mcp_server"],
-      "cwd": "/absolute/path/to/hybrid-rag-bench"
+      "cwd": "/absolute/path/to/hybrid-rag-bench",
+      "timeout": 120000
     }
   }
 }
 ```
 
+Or `claude mcp add --transport stdio hybrid-rag-bench -- python -m src.mcp_server`. Editing `.mcp.json` doesn't affect a running session — restart, or `/mcp` to reconnect.
+
+**Claude Desktop** — same block in `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`).
+
 ### Tools
 
 | tool | purpose |
 |---|---|
+| `warmup()` | build indexes and load models; call first (see cold start) |
 | `search_products(query, top_k, method)` | ranked retrieval; `method` ∈ `bm25` / `dense` / `hybrid` / `hybrid_rerank` |
-| `get_product(product_id)` | full record for one id |
-| `evaluate_query(query_id, method, k)` | recall@k and nDCG@k for a WANDS query against human judgments |
+| `get_product(product_id)` | full record for one id, with parsed feature pairs |
+| `evaluate_query(query_id, method, k, strict)` | recall@k, nDCG@k and MRR@k for a WANDS query against human judgments |
+
+A `grounded_product_search` **prompt** carries the grounding rules. It's a prompt rather than something the server injects: an MCP server cannot set its client's system prompt, and shouldn't be able to — a server connected for retrieval has no business rewriting how the model behaves generally. The server offers the rules; the user opts in. (`CLAUDE.md` applies the same rules automatically for Claude Code.)
+
+### Cold start and latency
+
+Indexes and models load lazily on first tool call, not at import — MCP clients start servers eagerly at boot, and building a BM25 index over ~43k chunks plus loading a cross-encoder would stall every session, including ones that never search. That cost doesn't vanish, it moves: **the first call takes 30–60s**, which can exceed a client's default tool timeout and looks like a hung search. Hence `warmup()`, which makes the cost explicit and attributable, and the `timeout` field above.
+
+Steady-state, per call:
+
+| stage | cost |
+|---|---|
+| BM25 search | ~10–50 ms |
+| dense encode + brute-force cosine | ~20–80 ms |
+| RRF fusion | negligible |
+| cross-encoder over 100 candidates | ~1–4 s CPU · ~200–400 ms GPU |
+
+So `hybrid_rerank` is dominated almost entirely by the reranker — which is also where its ranking advantage comes from. That tradeoff is why `method` is a tool parameter rather than a fixed server setting.
 
 ### Design choices
 
 **Retrieval strategy is a tool parameter, not server config.** The ablation above shows the quality/latency tradeoff is real: `hybrid_rerank` gives the best nDCG@10 (0.784) but pays for a cross-encoder pass over 100 candidates, while `bm25` needs no model at all. Rather than freezing one point on that curve, the choice is exposed in the tool schema with `hybrid_rerank` as the default — the caller can drop to a cheaper config when latency matters.
 
-**`evaluate_query` exists so tool reliability is measurable.** Most retrieval tools ask the model to trust the ranking. Here the caller can check the config it just used against labelled data. Metrics follow the same conventions as the benchmark: recall returns `null` rather than `0` when a query has no Exact judgment, and nDCG uses graded gains.
+**`evaluate_query` exists so tool reliability is measurable.** Most retrieval tools ask the model to trust the ranking. Here the caller can check the config it just used against labelled data. Metrics follow the same conventions as the benchmark: `null` rather than `0` when a metric is undefined for a query, and nDCG uses graded gains.
 
 **Typed schemas, bounded inputs, structured errors.** `top_k` is capped server-side; queries are length-bounded; failures return an error payload with a stable `code` instead of raising across the protocol boundary, so the model can correct a call rather than seeing an opaque crash. Tool responses carry `tool_version` so a client can detect a contract change.
 
-**stdio transport.** Single-user, client-launched, local. HTTP/SSE would be the choice for a shared remote server, which is also where auth and per-caller rate limiting would start to mean something — over stdio the client already owns the process. Corpus and models load lazily on first call, since MCP clients start servers at boot and a cross-encoder load on import would stall every session, including ones that never search.
+**stdio transport.** Single-user, client-launched, local. HTTP/SSE would be the choice for a shared remote server, which is also where auth and per-caller rate limiting would start to mean something — over stdio the client already owns the process.
+
+### Configuration
+
+| env var | default | purpose |
+|---|---|---|
+| `HYBRID_RAG_BENCH_DATA` | `data` | WANDS directory |
+| `HYBRID_RAG_BENCH_STRATEGY` | `name_desc` | first-stage chunk composition |
+
+`name_desc` is the balanced default — never the worst composition for any of the four methods. If you only ever call `hybrid_rerank`, set `name_only`: that's the best row in the benchmark, because once a cross-encoder reads the candidates the first stage only has to surface them, not order them.
 
 ## Methodology notes
 
