@@ -16,7 +16,12 @@ over stdio, where the client already owns the process.
 Corpus, indexes and models load lazily on first tool call, not at import. MCP
 clients start servers eagerly at boot; building a BM25 index and encoding 43k
 chunks on import would stall client startup for every session, including ones
-that never search.
+that never search. The cost doesn't vanish, it moves — see warmup().
+
+Grounding rules are exposed as a *prompt*, not injected. An MCP server cannot
+set its client's system prompt, and shouldn't be able to: a server connected
+for retrieval has no business rewriting how the model behaves generally. The
+server offers the rules; the user opts in.
 
 Env vars
 --------
@@ -30,6 +35,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from enum import Enum
 from typing import Any
 
@@ -55,6 +61,11 @@ INDEX_STRATEGY = os.environ.get("HYBRID_RAG_BENCH_STRATEGY", "name_desc")
 # indexed, matching the benchmark's fairness rule so rerank quality is not
 # confounded with index composition.
 RERANK_DOC_STRATEGY = "name_desc"
+
+CORPUS_CAVEAT = (
+    "Corpus is the WANDS research dataset (Wayfair product search), not a live "
+    "storefront. It carries no prices, stock levels or availability."
+)
 
 _state: dict[str, Any] = {}
 _lock = threading.Lock()
@@ -84,7 +95,7 @@ def _load() -> dict[str, Any]:
         compose = STRATEGIES[INDEX_STRATEGY]
         chunks = [c for product in dataset.products.values() for c in compose(product)]
 
-        _state["dataset"] = dataset
+        _state["n_chunks"] = len(chunks)
         _state["bm25"] = BM25Index(chunks)
         _state["dense"] = DenseIndex.build(
             chunks,
@@ -92,6 +103,7 @@ def _load() -> dict[str, Any]:
             cache_key=INDEX_STRATEGY,  # shares the ablation's embedding cache
         )
         _state["reranker"] = SentenceTransformersCrossEncoder()
+        _state["dataset"] = dataset  # set last: it is the "loaded" sentinel
     return _state
 
 
@@ -158,6 +170,37 @@ def _retrieve(query: str, method: RetrievalMethod, depth: int) -> list[int]:
 
 
 @mcp.tool()
+def warmup() -> dict[str, Any]:
+    """Load corpus, indexes and models. Call once before timing anything.
+
+    Cold start is 30-60s: the WANDS TSVs are parsed, a BM25 index is built over
+    ~43k chunks, embeddings are loaded or computed, and a cross-encoder is
+    pulled into memory. Lazy loading keeps client startup fast but moves that
+    cost onto whichever tool is called first, where it looks like a hung
+    search and can exceed the client's tool timeout.
+
+    This tool makes the cost explicit and attributable. Idempotent: subsequent
+    calls return immediately.
+    """
+    already = "dataset" in _state
+    started = time.perf_counter()
+    try:
+        state = _load()
+    except Exception as exc:  # noqa: BLE001
+        return _error("load_failed", f"{type(exc).__name__}: {exc}", data_dir=DATA_DIR)
+    return {
+        "ok": True,
+        "tool_version": TOOL_VERSION,
+        "already_loaded": already,
+        "elapsed_seconds": round(time.perf_counter() - started, 2),
+        "index_strategy": INDEX_STRATEGY,
+        "products": len(state["dataset"].products),
+        "chunks_indexed": state["n_chunks"],
+        "judged_queries": len(state["dataset"].judgments),
+    }
+
+
+@mcp.tool()
 def search_products(
     query: str = Field(..., min_length=1, max_length=500, description="Free-text product search query."),
     top_k: int = Field(10, ge=1, le=MAX_TOP_K, description=f"Results to return (max {MAX_TOP_K})."),
@@ -170,7 +213,9 @@ def search_products(
     """Search the WANDS product corpus and return a ranked list.
 
     Read-only and idempotent: the same query with the same method returns the
-    same ranking, so a client may safely retry.
+    same ranking, so a client may safely retry. Results carry no price, stock
+    or availability data — the corpus is a research dataset, not a storefront.
+    First call may take 30-60s if warmup() has not been called.
     """
     query = query.strip()
     if not query:
@@ -205,6 +250,7 @@ def search_products(
             "candidates_considered": len(ranking),
             "returned": len(results),
             "results": results,
+            "caveat": CORPUS_CAVEAT,
         }
     except Exception as exc:  # noqa: BLE001 -- boundary: never surface a traceback
         return _error("retrieval_failed", f"{type(exc).__name__}: {exc}", method=method.value)
@@ -214,7 +260,12 @@ def search_products(
 def get_product(
     product_id: int = Field(..., ge=0, description="Product id from a search_products result."),
 ) -> dict[str, Any]:
-    """Fetch the full record for one product id, including parsed features."""
+    """Fetch the full record for one product id, including parsed features.
+
+    Features come from the dataset's pipe-delimited attribute pairs and are
+    incomplete for many products — an absent attribute means unrecorded, not
+    absent from the physical product.
+    """
     try:
         product = _load()["dataset"].products.get(product_id)
         if product is None:
@@ -232,6 +283,7 @@ def get_product(
                 "average_rating": product.average_rating,
                 "review_count": product.review_count,
             },
+            "caveat": CORPUS_CAVEAT,
         }
     except Exception as exc:  # noqa: BLE001
         return _error("lookup_failed", f"{type(exc).__name__}: {exc}")
@@ -249,6 +301,9 @@ def evaluate_query(
     This is the tool that makes reliability checkable rather than assumed: the
     caller can verify how the retrieval config it just used actually performs
     on labelled data, instead of taking the ranking on trust.
+
+    Judgments are pooled, so an unjudged product counts as irrelevant. Metrics
+    are therefore a lower bound on true quality.
     """
     try:
         from evals.metrics import mrr, ndcg_at_k, recall_at_k
@@ -286,6 +341,32 @@ def evaluate_query(
         }
     except Exception as exc:  # noqa: BLE001
         return _error("eval_failed", f"{type(exc).__name__}: {exc}")
+
+
+@mcp.prompt()
+def grounded_product_search() -> str:
+    """Grounding rules for answering product questions from this corpus.
+
+    Exposed as a prompt rather than injected server-side: MCP servers cannot
+    set a client's system prompt, and shouldn't be able to. The user opts in.
+    """
+    return """You answer product questions using only the hybrid-rag-bench tools.
+
+Rules:
+- Every product you mention must come from a search_products result in this
+  conversation. Cite it as name (id: N). Never invent a product, id, price,
+  material, or dimension.
+- If a detail isn't in the tool output, call get_product for it. If it still
+  isn't there, say the data doesn't contain it. Do not infer it from the
+  product name — names and descriptions disagree often in this corpus.
+- If search returns nothing relevant, say so and suggest a reformulation.
+  Do not fill the gap from general knowledge.
+- If a tool returns ok: false, report the error code. Do not answer as
+  though the call succeeded.
+- Default to method="hybrid_rerank". Use "bm25" or "dense" only when the
+  user asks for speed.
+- When the user is testing retrieval quality rather than shopping, use
+  evaluate_query so the answer rests on labelled data."""
 
 
 if __name__ == "__main__":
